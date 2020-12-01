@@ -1,3 +1,6 @@
+using System.Globalization;
+using System.Net.Http;
+using System.Collections.Generic;
 using System;
 using XiaWorld;
 using SevenZip;
@@ -8,6 +11,7 @@ using System.Linq;
 using Newtonsoft.Json;
 using System.Text;
 using XiaSaveFileLib;
+using Assets.USecurity;
 
 namespace XiaSaveFileLib
 {
@@ -30,8 +34,29 @@ namespace XiaSaveFileLib
             {
                 throw new XiaException("Failed to build save file \n" + e.Message, e);
             }
-            memoryStream.Dispose();
-            memoryStream.Close();
+            finally
+            {
+                memoryStream.Dispose();
+                memoryStream.Close();
+            }
+        }
+
+        public static async Task SaveFileAsync(SaveFile file, Stream outStream)
+        {
+            var memory = new MemoryStream(Encoding.UTF8.GetBytes(file.FileContent));
+            try
+            {
+                await BuildSaveFileAsync(memory, outStream, file.Header);
+            }
+            catch (Exception e)
+            {
+                throw new XiaException("Failed to build save file \n" + e.Message, e);
+            }
+            finally
+            {
+                memory.Dispose();
+                memory.Close();
+            }
         }
 
         private static async Task BuildSaveFileAsync(Stream st, string path, SaveFile.FileHeader header)
@@ -46,6 +71,18 @@ namespace XiaSaveFileLib
             if (IntPtr.Size == 4)
                 GC.Collect();
             await Task.Run(() => SevenZipHelper.Zip(st, path, head));
+        }
+
+        private static async Task BuildSaveFileAsync(Stream inStream, Stream outStream, SaveFile.FileHeader header)
+        {
+            var saveHead = new SaveMgr.SaveHead();
+            saveHead.V = header.Version;
+            saveHead.M = header.Mode;
+            saveHead.Ms = header.Mods;
+            saveHead.U = header.WriteTime;
+
+            string head = Assets.USecurity.AES.Encrypt(JsonConvert.SerializeObject((object)saveHead), "bh89757");
+            await Task.Run(() => SevenZipHelper.Zip(inStream, outStream, head));
         }
 
         ///<summary>Loads a xiaSaveFileLib.SaveFile object from the given path string.
@@ -94,6 +131,31 @@ namespace XiaSaveFileLib
             return file;
         }
 
+        public static async Task<SaveFile> LoadSaveFileAsync(Stream inStream, string fileName, int head = 2000)
+        {
+            var memory = new MemoryStream();
+            var saveHead = await DecodeAsync(inStream, memory, head);
+
+            String content;
+            using (var reader = new StreamReader(memory))
+                content = await reader.ReadToEndAsync();
+
+            var file = new SaveFile()
+            {
+                Header = new SaveFile.FileHeader()
+                {
+                    Decompressed = saveHead.T,
+                    Mode = saveHead.M,
+                    Version = saveHead.V,
+                    WriteTime = saveHead.U,
+                    Mods = saveHead.Ms,
+                    FileName = fileName
+                },
+                FileContent = content
+            };
+
+            return file;
+        }
 
         public static async Task<string> GetSaveFileAsJson(string path, int head = 2000)
         {
@@ -112,6 +174,31 @@ namespace XiaSaveFileLib
             await Task.Run(() => SevenZipHelper.Unzip(OriPath, destPath, head));
 
             return fileHead;
+        }
+
+        private static async Task<SaveMgr.SaveHead> DecodeAsync(Stream inStream, Stream outStream, int head = 2000)
+        {
+            int len = 0;
+            var fileHead = GetFileHead(inStream, out len);
+            head = len > head ? len : head;
+
+            await Task.Run(() => SevenZipHelper.Unzip(inStream, outStream, head));
+            outStream.Position = 0;
+            return fileHead;
+        }
+
+        private static SaveMgr.SaveHead GetFileHead(Stream stream, out int len)
+        {
+            var initialPosition = stream.Position;
+            len = 0;
+            List<byte> byteList = new List<byte>();
+            for (int i = stream.ReadByte(); i > -1 && i != 0 && (i != 32 && i != 93 && i != 123); i = stream.ReadByte())
+                byteList.Add((byte)i);
+            len = byteList.Count;
+            var saveHead = JsonConvert.DeserializeObject<SaveMgr.SaveHead>(AES.Decrypt2Str(Encoding.Default.GetString(byteList.ToArray()).TrimEnd(new char[1]), "bh89757"));
+            stream.Position = initialPosition;
+
+            return saveHead;
         }
     }
 }
